@@ -15,15 +15,21 @@ from ipv8.messaging.lazy_payload import VariablePayload,vp_compile
 from ipv8.peer import Peer
 from ipv8_service import IPv8
 
+# Registration parameters: the community to join, the server we submit to, and
+# the identity/PoW settings. EMAIL and GITHUB_URL are also the bytes we mine over.
 COMMUNITY_ID_HEX = "2c1cc6e35ff484f99ebdfb6108477783c0102881"
 SERVER_PUBLIC_KEY_HEX = "4c69624e61434c504b3a86b23934a28d669c390e2d1fc0b0870706c4591cc0cb178bc5a811da6d87d27ef319b2638ef60cc8d119724f4c53a1ebfad919c3ac4136c501ce5c09364e0ebb"
-EMAIL = "A.A.Cirjaliu-Davidescu@student.tudelft.nl"
-GITHUB_URL = "https://github.com/AlexDC-2003/blockchain-lab1"
+
+#TODO: Fill in your email and github url
+EMAIL = "input-your-email"
+GITHUB_URL = "input-your-url"
+
 DIFFICULTY_BITS = 28
 KEY_FILE = "my_id.pem"
 RESPONSE_TIMEOUT_SECONDS = 15 * 60
-DEBUG_PRINT = True
+DEBUG_PRINT = False
 
+# communication with the server
 @vp_compile
 class SubmissionPayload(VariablePayload):
     msg_id = 1
@@ -36,14 +42,18 @@ class ResponsePayload(VariablePayload):
     format_list = ["?", "varlenHutf8"]
     names = ["success", "message"]
 
+# Check if the mined nonce meets the target difficulty
+# True if the digest has at least `bits` leading zero bits.
 def _meets_difficulty(digest: bytes, bits: int) -> bool:
     full_zero_bytes, remainder = divmod(bits, 8)
+    # Every whole leading byte must be zero.
     if any(digest[i] != 0 for i in range(full_zero_bytes)):
         return False
     if remainder == 0:
         return True
     return digest[full_zero_bytes] < (1 << (8 - remainder))
 
+# Mine the PoW.
 def mine_pow(email: str, github_url: str, bits: int = 28, start: int = 0) -> int:
     prefix = email.encode("utf-8") + b"\n" + github_url.encode("utf-8") + b"\n"
     base = hashlib.sha256(prefix)
@@ -53,7 +63,9 @@ def mine_pow(email: str, github_url: str, bits: int = 28, start: int = 0) -> int
     report_every = 1 << 20
     t0 = time.time()
     last_report = t0
+    # Brute force nonce-mining
     while nonce < (1 << 63):
+        # Try this nonce, copy the prefixed state, check if it meets diffculty append the nonce, hash.
         h = base.copy()
         h.update(pack(">q", nonce))
         digest = h.digest()
@@ -63,6 +75,7 @@ def mine_pow(email: str, github_url: str, bits: int = 28, start: int = 0) -> int
             return nonce
         nonce += 1
         if DEBUG_PRINT is True:
+            # Periodically report progress and the current hash rate.
             if nonce % report_every == 0:
                 now = time.time()
                 rate = report_every / max(now - last_report, 1e-9)
@@ -79,27 +92,32 @@ class PoWCommunity(Community):
         self.server_pubkey_bin = unhexlify(SERVER_PUBLIC_KEY_HEX)
         self.nonce: int | None = None
         self.submitted_to: set[bytes] = set()
-        self.done = asyncio.Event()
+        self.done = asyncio.Event()             # set once the server replies to end
         self.last_response: ResponsePayload | None = None
 
     def started(self) -> None:
+        # IPv8 calls this once the overlay is up; kick off the submit loop.
         self.register_task("submit_loop", self._submit_loop)
 
     async def _submit_loop(self) -> None:
+        # Mine the nonce before you connect to the server.
         if self.nonce is None:
             loop = asyncio.get_running_loop()
             self.nonce = await loop.run_in_executor(None, mine_pow, EMAIL, GITHUB_URL, DIFFICULTY_BITS)
         print("mined, waiting for server")
         announced_peers: set[bytes] = set()
         tick = 0
+        # Poll discovered peers. When the server shows up, submit our nonce once.
         while not self.done.is_set():
             peers = self.get_peers()
             for peer in peers:
                 pk = peer.public_key.key_to_bin()
                 if pk not in announced_peers:
+                    # Log each peer the first time we see it.
                     announced_peers.add(pk)
                     tag = "SERVER" if pk == self.server_pubkey_bin else "peer"
                     print(f"ipv8 discovered {tag} mid={peer.mid.hex()} addr={peer.address}")
+                # Identify the server by its pubkey and submit exactly once.
                 if pk == self.server_pubkey_bin and pk not in self.submitted_to:
                     self.submitted_to.add(pk)
                     print(f"ipv8 sending submission to server at {peer.address}")
@@ -120,6 +138,7 @@ class PoWCommunity(Community):
 
     @lazy_wrapper(ResponsePayload)
     def on_response(self, peer: Peer, payload: ResponsePayload) -> None:
+        # Only trust a response that actually came from the server's key.
         if peer.public_key.key_to_bin() != self.server_pubkey_bin:
             print(f"ipv8 ignoring response from non-server peer mid={peer.mid.hex()}")
             return
@@ -129,6 +148,7 @@ class PoWCommunity(Community):
         self.done.set()
 
 async def main() -> None:
+    # Build a minimal IPv8 config
     builder = ConfigBuilder().clear_keys().clear_overlays()
     builder.add_key("my_key", "curve25519", KEY_FILE)
     builder.add_overlay("PoWCommunity", "my_key",[WalkerDefinition(Strategy.RandomWalk, 20, {"timeout": 3.0})],default_bootstrap_defs,{},[("started",)])
